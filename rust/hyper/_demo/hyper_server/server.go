@@ -45,10 +45,10 @@ type ServiceUserdata struct {
 func onSignal(handle *libuv.Signal, signum c.Int) {
 	fmt.Printf("Caught signal %d... exiting\n", signum)
 	shouldExit = true
-	libuv.SignalStop(sigintHandle)
-	libuv.SignalStop(sigtermHandle)
-	libuv.Close(handle, nil)
-	libuv.LoopClose(loop)
+	sigintHandle.Stop()
+	sigtermHandle.Stop()
+	(*libuv.Handle)(unsafe.Pointer(handle)).Close(nil)
+	loop.Close()
 }
 
 func closeWalkCb(handle *libuv.Handle, arg c.Pointer) {
@@ -88,7 +88,7 @@ func closeConn(handle *libuv.Handle) {
 }
 
 func onPoll(handle *libuv.Poll, status c.Int, events c.Int) {
-	conn := (*ConnData)(unsafe.Pointer((*libuv.Handle)(c.Pointer(handle)).GetData()))
+	conn := (*ConnData)(unsafe.Pointer((*libuv.Handle)(unsafe.Pointer(handle)).GetData()))
 
 	if status < 0 {
 		fmt.Fprintf(os.Stderr, "Poll error: %s\n", libuv.Strerror(libuv.Errno(status)))
@@ -115,7 +115,7 @@ func updateConnDataRegistrations(conn *ConnData, create bool) bool {
 		events |= libuv.WRITABLE
 	}
 
-	r := libuv.PollStart(&conn.PollHandle, events, onPoll)
+	r := conn.PollHandle.Start(events, onPoll)
 	if r < 0 {
 		fmt.Fprintf(os.Stderr, "uv_poll_start error: %s\n", libuv.Strerror(libuv.Errno(r)))
 		return false
@@ -125,8 +125,7 @@ func updateConnDataRegistrations(conn *ConnData, create bool) bool {
 
 func readCb(userdata c.Pointer, ctx *hyper.Context, buf *byte, bufLen uintptr) uintptr {
 	conn := (*ConnData)(userdata)
-	//ret := syscall.Recv(c.Int(conn.Stream.Iowatcher.Fd), c.Pointer(buf), c.Size(bufLen), 0)
-	ret := net.Recv(c.Int(conn.Stream.GetIoWatcherFd()), c.Pointer(buf), unsafe.Sizeof(bufLen), 0)
+	ret := net.Recv(conn.Stream.GetIoWatcherFd(), c.Pointer(buf), unsafe.Sizeof(bufLen), 0)
 
 	if ret >= 0 {
 		return uintptr(ret)
@@ -153,7 +152,7 @@ func readCb(userdata c.Pointer, ctx *hyper.Context, buf *byte, bufLen uintptr) u
 
 func writeCb(userdata c.Pointer, ctx *hyper.Context, buf *byte, bufLen uintptr) uintptr {
 	conn := (*ConnData)(userdata)
-	ret := net.Send(c.Int(conn.Stream.GetIoWatcherFd()), c.Pointer(buf), unsafe.Sizeof(bufLen), 0)
+	ret := net.Send(conn.Stream.GetIoWatcherFd(), c.Pointer(buf), unsafe.Sizeof(bufLen), 0)
 
 	if ret >= 0 {
 		return uintptr(ret)
@@ -188,8 +187,7 @@ func createConnData(client *libuv.Tcp) *ConnData {
 	conn.IsClosing = 0
 	conn.RequestCount = 0
 
-	//r := conn.PollHandle.Init(loop, c.Int(client.Iowatcher.Fd))
-	r := libuv.PollInit(loop, &conn.PollHandle, client.GetIoWatcherFd())
+	r := libuv.PollInit(loop, &conn.PollHandle, libuv.OsFd(client.GetIoWatcherFd()))
 	if r < 0 {
 		fmt.Fprintf(os.Stderr, "uv_poll_init error: %s\n", libuv.Strerror(libuv.Errno(r)))
 		c.Free(c.Pointer(conn))
@@ -200,8 +198,7 @@ func createConnData(client *libuv.Tcp) *ConnData {
 	(*libuv.Handle)(c.Pointer(&conn.Stream)).SetData(c.Pointer(conn))
 
 	if !updateConnDataRegistrations(conn, true) {
-		//conn.PollHandle.Close(nil)
-		libuv.Close((*libuv.Handle)(c.Pointer(&conn.PollHandle)), nil)
+		(*libuv.Handle)(unsafe.Pointer(&conn.PollHandle)).Close(nil)
 		c.Free(c.Pointer(conn))
 		return nil
 	}
@@ -291,9 +288,9 @@ func serverCallback(userdata c.Pointer, request *hyper.Request, channel *hyper.R
 	}
 
 	var scheme, authority, pathAndQuery [1024]byte
-	schemeLen := unsafe.Sizeof(len(scheme))
-	authorityLen := unsafe.Sizeof(len(authority))
-	pathAndQueryLen := unsafe.Sizeof(len(pathAndQuery))
+	schemeLen := unsafe.Sizeof(scheme)
+	authorityLen := unsafe.Sizeof(authority)
+	pathAndQueryLen := unsafe.Sizeof(pathAndQuery)
 
 	uriResult := request.URIParts(&scheme[0], &schemeLen, &authority[0], &authorityLen, &pathAndQuery[0], &pathAndQueryLen)
 	if uriResult == hyper.OK {
@@ -405,7 +402,7 @@ func onNewConnection(serverStream *libuv.Stream, status c.Int) {
 		userdata := createServiceUserdata()
 		if userdata == nil {
 			fmt.Fprintf(os.Stderr, "Failed to create service_userdata\n")
-			libuv.Close((*libuv.Handle)(client), onClose)
+			(*libuv.Handle)(unsafe.Pointer(client)).Close(onClose)
 			return
 		}
 		userdata.Executor = exec
@@ -414,11 +411,11 @@ func onNewConnection(serverStream *libuv.Stream, status c.Int) {
 		addrlen := c.Int(unsafe.Sizeof(addr))
 		client.Getpeername((*net.SockAddr)(c.Pointer(&addr)), &addrlen)
 
-		if addr.Addr.Fam == syscall.AF_INET {
+		if addr.Family == net.AF_INET {
 			s := (*net.SockaddrIn)(c.Pointer(&addr))
 			libuv.Ip4Name(s, (*c.Char)(&userdata.Host[0]), unsafe.Sizeof(userdata.Host))
 			c.Snprintf((*c.Char)(&userdata.Port[0]), unsafe.Sizeof(userdata.Port), c.Str("%d"), c.Int(net.Ntohs(s.Port)))
-		} else if addr.Addr.Fam == net.AF_INET6 {
+		} else if addr.Family == net.AF_INET6 {
 			s := (*net.SockaddrIn6)(c.Pointer(&addr))
 			libuv.Ip6Name(s, (*c.Char)(&userdata.Host[0]), unsafe.Sizeof(userdata.Host))
 			c.Snprintf((*c.Char)(&userdata.Port[0]), unsafe.Sizeof(userdata.Port), c.Str("%d"), c.Int(net.Ntohs(s.Port)))
@@ -430,7 +427,7 @@ func onNewConnection(serverStream *libuv.Stream, status c.Int) {
 		conn := createConnData(client)
 		if conn == nil {
 			fmt.Fprintf(os.Stderr, "Failed to create conn_data\n")
-			libuv.Close((*libuv.Handle)(client), onClose)
+			(*libuv.Handle)(unsafe.Pointer(client)).Close(onClose)
 			freeServiceUserdata(c.Pointer(userdata))
 			return
 		}
@@ -457,7 +454,7 @@ func onNewConnection(serverStream *libuv.Stream, status c.Int) {
 		http1Opts.Free()
 		http2Opts.Free()
 	} else {
-		libuv.Close((*libuv.Handle)(client), onClose)
+		(*libuv.Handle)(unsafe.Pointer(client)).Close(onClose)
 	}
 }
 
@@ -493,7 +490,7 @@ func main() {
 
 	// Set SO_REUSEADDR
 	yes := c.Int(1)
-	r = net.Setsockopt(server.GetIoWatcherFd(), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, (*c.Char)(c.Pointer(&yes)), c.Uint(unsafe.Sizeof(yes)))
+	r = net.SetSockOpt(server.GetIoWatcherFd(), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, (*c.Char)(c.Pointer(&yes)), c.Uint(unsafe.Sizeof(yes)))
 	if r != 0 {
 		fmt.Fprintf(os.Stderr, "setsockopt error %s\n", libuv.Strerror(libuv.Errno(r)))
 		os.Exit(1)
@@ -506,15 +503,15 @@ func main() {
 	}
 
 	libuv.SignalInit(loop, &sigintHandle)
-	libuv.SignalStart(&sigintHandle, onSignal, syscall.SIGINT)
+	sigintHandle.Start(onSignal, syscall.SIGINT)
 
 	libuv.SignalInit(loop, &sigtermHandle)
-	libuv.SignalStart(&sigtermHandle, onSignal, syscall.SIGTERM)
+	sigtermHandle.Start(onSignal, syscall.SIGTERM)
 
 	fmt.Printf("http handshake (hyper v%s) ...\n", hyper.Version())
 
 	for {
-		libuv.Run(loop, libuv.RUN_NOWAIT)
+		loop.Run(libuv.RUN_NOWAIT)
 
 		task := exec.Poll()
 		for task != nil && !shouldExit {
@@ -529,11 +526,11 @@ func main() {
 					fmt.Printf("Connection task completed for request %d\n", conn.RequestCount)
 					if conn.IsClosing == 0 {
 						conn.IsClosing = 1
-						if !libuv.IsClosing((*libuv.Handle)(conn.PollHandle)) {
-							libuv.Close((*libuv.Handle)(conn.PollHandle), nil)
+						if !(*libuv.Handle)(unsafe.Pointer(&conn.PollHandle)).IsClosing() {
+							(*libuv.Handle)(unsafe.Pointer(&conn.PollHandle)).Close(onClose)
 						}
-						if !libuv.IsClosing((*libuv.Handle)(conn.Stream)) {
-							libuv.Close((*libuv.Handle)(conn.Stream), closeConn)
+						if !(*libuv.Handle)(unsafe.Pointer(&conn.Stream)).IsClosing() {
+							(*libuv.Handle)(unsafe.Pointer(&conn.Stream)).Close(onClose)
 						}
 					}
 				}
@@ -577,15 +574,16 @@ func main() {
 		}
 
 		// Handle any pending closures
-		libuv.Run(loop, libuv.RUN_NOWAIT)
+		loop.Run(libuv.RUN_NOWAIT)
 	}
 
 	// Cleanup
 	fmt.Println("Closing all handles...")
-	libuv.Walk(loop, closeWalkCb, nil)
-	libuv.Run(loop, libuv.RUN_DEFAULT)
+	loop.Walk(closeWalkCb, nil)
 
-	libuv.LoopClose(loop)
+	loop.Run(libuv.RUN_DEFAULT)
+
+	loop.Close()
 	exec.Free()
 
 	fmt.Println("Shutdown complete.")
